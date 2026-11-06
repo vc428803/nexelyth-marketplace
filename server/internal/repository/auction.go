@@ -2,7 +2,10 @@ package repository
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
+	"sort"
 	"time"
 
 	"todo_api/internal/models"
@@ -362,10 +365,12 @@ func GetAuctionBidsByListingID(pool *pgxpool.Pool, listingID string) ([]models.A
 // PlaceBid 建立一筆出價，並同步更新 auction_listings 的 current_price / highest_bidder_id
 // 這裡一定要用 transaction，避免多人同時出價造成資料不一致
 func PlaceBid(pool *pgxpool.Pool, listingID string, bidderID string, bidAmount int64) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	utils.PerformOperation(ctx)
+	if bidAmount <= 0 {
+		return errors.New("bid amount must be positive")
+	}
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -373,86 +378,221 @@ func PlaceBid(pool *pgxpool.Pool, listingID string, bidderID string, bidAmount i
 	}
 	defer tx.Rollback(ctx)
 
-	// 先把該 listing 鎖住，避免同時多人更新
-	query := `
-		SELECT
-			seller_id,
-			current_price,
-			min_increment,
-			status,
-			end_time
-		FROM auction_listings
-		WHERE id = $1
-		FOR UPDATE
-	`
-
+	// 1. 鎖定拍賣商品
 	var sellerID string
-	var currentPrice int64
-	var minIncrement int64
+	var highestBidder sql.NullString
+	var currentPrice, minIncrement int64
 	var status string
 	var endTime time.Time
 
-	err = tx.QueryRow(ctx, query, listingID).Scan(
-		&sellerID,
-		&currentPrice,
-		&minIncrement,
-		&status,
-		&endTime,
+	err = tx.QueryRow(ctx, `
+        SELECT seller_id, highest_bidder_id,
+               current_price, min_increment,
+               status, end_time
+        FROM auction_listings
+        WHERE id = $1
+        FOR UPDATE
+    `, listingID).Scan(
+		&sellerID, &highestBidder,
+		&currentPrice, &minIncrement,
+		&status, &endTime,
 	)
 	if err != nil {
-		return err
+		return fmt.Errorf("load listing: %w", err)
 	}
 
-	// 不允許自己競標自己的商品
 	if sellerID == bidderID {
 		return errors.New("seller cannot bid on own listing")
 	}
-
-	// 只有 active 狀態才可以出價
 	if status != "active" {
 		return errors.New("listing is not active")
 	}
-
-	// 超過結束時間就不能再出價
-	if time.Now().After(endTime) {
+	if !time.Now().Before(endTime) {
 		return errors.New("auction has already ended")
 	}
-
-	// 出價必須大於等於目前價格 + 最小加價幅度
-	minValidBid := currentPrice + minIncrement
-	if bidAmount < minValidBid {
+	if currentPrice < 0 || minIncrement <= 0 {
+		return errors.New("invalid auction price configuration")
+	}
+	// 使用減法比較，避免 currentPrice + minIncrement 溢位
+	if bidAmount <= currentPrice ||
+		bidAmount-currentPrice < minIncrement {
 		return errors.New("bid amount is too low")
 	}
 
-	// 新增出價紀錄
-	insertBidQuery := `
-		INSERT INTO auction_bids (
-			listing_id,
-			bidder_id,
-			bid_amount
+	// 2. 取得前任最高出價者的保留資金
+	var oldHoldID, oldBidID string
+	var oldAmount int64
+	var oldBidderID string
+	hasOldHold := highestBidder.Valid
+
+	if hasOldHold {
+		err = tx.QueryRow(ctx, `
+            SELECT id, bid_id, bidder_id, amount
+            FROM auction_fund_holds
+            WHERE listing_id = $1 AND status = 'HELD'
+            FOR UPDATE
+        `, listingID).Scan(
+			&oldHoldID, &oldBidID,
+			&oldBidderID, &oldAmount,
 		)
-		VALUES ($1, $2, $3)
-	`
+		if err != nil {
+			return fmt.Errorf("existing bid hold missing: %w", err)
+		}
 
-	_, err = tx.Exec(ctx, insertBidQuery, listingID, bidderID, bidAmount)
+		if oldBidderID != highestBidder.String ||
+			oldAmount != currentPrice {
+			return errors.New("existing bid hold is inconsistent")
+		}
+	}
+
+	// 3. 按固定順序鎖定涉及的錢包，降低死鎖風險
+	userIDs := []string{bidderID}
+	if hasOldHold && oldBidderID != bidderID {
+		userIDs = append(userIDs, oldBidderID)
+	}
+	sort.Strings(userIDs)
+
+	type lockedWallet struct {
+		ID      string
+		Balance int64
+	}
+	wallets := make(map[string]*lockedWallet)
+
+	for _, userID := range userIDs {
+		w := &lockedWallet{}
+		err = tx.QueryRow(ctx, `
+            SELECT id, balance
+            FROM wallets
+            WHERE user_id = $1 AND currency_code = 'G'
+            FOR UPDATE
+        `, userID).Scan(&w.ID, &w.Balance)
+		if err != nil {
+			return fmt.Errorf("wallet unavailable for user %s: %w", userID, err)
+		}
+		wallets[userID] = w
+	}
+
+	// 4. 計算資金是否足夠
+	// 自己提高出價時，原有保留金額可以重新使用
+	available := wallets[bidderID].Balance
+	if hasOldHold && oldBidderID == bidderID {
+		// oldAmount <= currentPrice < bidAmount
+		// 所以只需檢查增加的差額
+		if available < bidAmount-oldAmount {
+			return errors.New("insufficient wallet balance")
+		}
+	} else if available < bidAmount {
+		return errors.New("insufficient wallet balance")
+	}
+
+	// 5. 釋放前任最高出價者的資金
+	if hasOldHold {
+		oldWallet := wallets[oldBidderID]
+		const maxInt64 = int64(^uint64(0) >> 1)
+
+		// 防止退款時 BIGINT 溢位
+		if oldAmount <= 0 ||
+			oldWallet.Balance > maxInt64-oldAmount {
+			return errors.New("invalid refund amount")
+		}
+
+		oldWallet.Balance += oldAmount
+
+		_, err = tx.Exec(ctx, `
+            UPDATE wallets
+            SET balance = $1, updated_at = NOW()
+            WHERE id = $2
+        `, oldWallet.Balance, oldWallet.ID)
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.Exec(ctx, `
+            INSERT INTO wallet_transactions
+                (wallet_id, amount_delta, balance_after,
+                 transaction_type, reference_id)
+            VALUES ($1, $2, $3, 'BID_RELEASE', $4)
+        `, oldWallet.ID, oldAmount,
+			oldWallet.Balance, oldBidID)
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.Exec(ctx, `
+            UPDATE auction_fund_holds
+            SET status = 'RELEASED', updated_at = NOW()
+            WHERE id = $1 AND status = 'HELD'
+        `, oldHoldID)
+		if err != nil {
+			return err
+		}
+	}
+
+	// 6. 保留新出價者的資金
+	newWallet := wallets[bidderID]
+
+	if newWallet.Balance < bidAmount {
+		return errors.New("insufficient wallet balance")
+	}
+
+	newWallet.Balance -= bidAmount
+
+	_, err = tx.Exec(ctx, `
+        UPDATE wallets
+        SET balance = $1, updated_at = NOW()
+        WHERE id = $2
+    `, newWallet.Balance, newWallet.ID)
 	if err != nil {
 		return err
 	}
 
-	// 更新拍賣商品目前價格與最高出價者
-	updateListingQuery := `
-		UPDATE auction_listings
-		SET
-			current_price = $1,
-			highest_bidder_id = $2,
-			updated_at = CURRENT_TIMESTAMP
-		WHERE id = $3
-	`
+	// 7. 新增競標紀錄，取得 bid ID
+	var newBidID string
 
-	_, err = tx.Exec(ctx, updateListingQuery, bidAmount, bidderID, listingID)
+	err = tx.QueryRow(ctx, `
+        INSERT INTO auction_bids
+            (listing_id, bidder_id, bid_amount)
+        VALUES ($1, $2, $3)
+        RETURNING id
+    `, listingID, bidderID, bidAmount).Scan(&newBidID)
 	if err != nil {
 		return err
 	}
 
+	// 8. 建立新資金保留紀錄
+	_, err = tx.Exec(ctx, `
+        INSERT INTO auction_fund_holds
+            (listing_id, bid_id, bidder_id, amount, status)
+        VALUES ($1, $2, $3, $4, 'HELD')
+    `, listingID, newBidID, bidderID, bidAmount)
+	if err != nil {
+		return err
+	}
+
+	// 9. 記錄錢包扣款
+	_, err = tx.Exec(ctx, `
+        INSERT INTO wallet_transactions
+            (wallet_id, amount_delta, balance_after,
+             transaction_type, reference_id)
+        VALUES ($1, $2, $3, 'BID_HOLD', $4)
+    `, newWallet.ID, -bidAmount,
+		newWallet.Balance, newBidID)
+	if err != nil {
+		return err
+	}
+
+	// 10. 更新最高出價
+	_, err = tx.Exec(ctx, `
+        UPDATE auction_listings
+        SET current_price = $1,
+            highest_bidder_id = $2,
+            updated_at = NOW()
+        WHERE id = $3
+    `, bidAmount, bidderID, listingID)
+	if err != nil {
+		return err
+	}
+
+	// 11. 所有資料一次提交
 	return tx.Commit(ctx)
 }

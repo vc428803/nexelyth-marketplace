@@ -1,8 +1,10 @@
 package config
 
 import (
-	"log"
-	"os" //retrieve environment variables
+	"errors"
+	"fmt"
+	"os"
+	"strings"
 
 	"github.com/joho/godotenv"
 )
@@ -13,28 +15,35 @@ type Config struct {
 	JWTSecret   string
 }
 
-/*
-make api call to database
-*/
-// pointer : point to the address or instance in memory
 func Load() (*Config, error) {
-	// loads .env from the current directory
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file")
+	// 載入 .env
+	// 已存在的系統環境變數優先，不會被 .env 覆蓋。
+	if err := godotenv.Load(); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("failed to load .env: %w", err)
+		}
 	}
 
-	/* *pointer (point to a struct) = &reference{} (reference to a struct as value) => https://stackoverflow.com/questions/47296325/passing-by-reference-and-value-in-go-to-functions
-		func someFunc(x *int) {
-	    *x = 2 // Whatever variable caller passed in will now be 2
-	    y := 7
-	    x = &y // has no impact on the caller because we overwrote the pointer value!
+	cfg := &Config{
+		DatabaseURL: strings.TrimSpace(os.Getenv("POSTGRES_URL")),
+		Port:        strings.TrimSpace(os.Getenv("POSTGRES_PORT")),
+		JWTSecret:   strings.TrimSpace(os.Getenv("JWT_SECRET")),
 	}
-	*/
-	var config *Config = &Config{
-		DatabaseURL: os.Getenv("POSTGRES_URL"),
-		Port:        os.Getenv("POSTGRES_PORT"),
-		JWTSecret:   os.Getenv("JWT_SECRET"),
+
+	// 移除連線字串前後可能存在的引號
+	cfg.DatabaseURL = strings.Trim(cfg.DatabaseURL, `"'`)
+
+	if cfg.DatabaseURL == "" {
+		return nil, errors.New("POSTGRES_URL is required")
 	}
-	return config, nil
+
+	if cfg.Port == "" {
+		return nil, errors.New("POSTGRES_PORT is required")
+	}
+
+	if cfg.JWTSecret == "" {
+		return nil, errors.New("JWT_SECRET is required")
+	}
+
+	return cfg, nil
 }

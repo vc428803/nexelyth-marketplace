@@ -55,9 +55,8 @@ func Connect(databaseURL string) (*pgxpool.Pool, error) {
 
 	// 驗證連線
 	if err = pool.Ping(ctx); err != nil {
-		fmt.Errorf("unable to ping database: %w", err)
 		pool.Close()
-		return nil, err
+		return nil, fmt.Errorf("unable to ping database: %w", err)
 	}
 
 	slog.Info("Successfully connected to PostgreSQL database")
