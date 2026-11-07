@@ -2,11 +2,12 @@
 package main
 
 import (
+	"context"
 	"log"
-
 	"todo_api/internal/app"
 	"todo_api/internal/config"
 	"todo_api/internal/database"
+	"todo_api/internal/worker"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -25,6 +26,12 @@ func main() {
 		log.Fatal(err)
 	}
 	defer pool.Close()
+
+	// 啟動拍賣自動結算背景工作
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	defer cancelWorker()
+
+	go worker.StartAuctionWorker(workerCtx, pool)
 
 	// 建立已完成基礎設定的 router
 	router := app.NewRouter(cfg)

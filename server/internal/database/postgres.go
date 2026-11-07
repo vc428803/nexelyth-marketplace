@@ -40,10 +40,10 @@ func Connect(databaseURL string) (*pgxpool.Pool, error) {
 
 	// 自訂連線池參數
 	config.MaxConns = 20                        // 最大連線數
-	config.MinConns = 5                         // 最小連線數
+	config.MinConns = 0                         // Go Server 在沒有資料庫請求時，就不必保留最低數量的連線，不代表 Neon 一定會在 2 分鐘後休眠。Neon 的休眠由其自身機制決定
 	config.HealthCheckPeriod = 30 * time.Second // 健康檢查週期
 	config.MaxConnLifetime = 1 * time.Hour      // 連線最長存活時間
-	config.MaxConnIdleTime = 5 * time.Minute    // 連線閒置時間
+	config.MaxConnIdleTime = 2 * time.Minute    // 閒置連線達到約 2 分鐘後，可以由連線池的維護機制回收
 
 	var pool *pgxpool.Pool
 	// 建立連線池
