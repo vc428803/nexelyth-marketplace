@@ -53,6 +53,7 @@ func main() {
 	// 請勿將此工具暴露為公開 HTTP API。
 	ctx := context.Background()
 
+	// 結算與物品轉移
 	if err := repository.SettleAuction(
 		ctx,
 		pool,

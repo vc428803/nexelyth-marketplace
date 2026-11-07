@@ -597,7 +597,6 @@ func PlaceBid(pool *pgxpool.Pool, listingID string, bidderID string, bidAmount i
 	return tx.Commit(ctx)
 }
 
-// SettleAuction 結算一筆已截止的拍賣。
 // 已完成結算的拍賣再次呼叫時，不會重複付款或交付物品。
 func SettleAuction(
 	ctx context.Context,
@@ -650,13 +649,83 @@ func SettleAuction(
 		return errors.New("auction has not ended")
 	}
 
-	// 第一階段先處理有得標者的拍賣
-	if !highestBidder.Valid {
-		return errors.New("auction has no winning bidder")
-	}
-
+	// 無論成交或流標，都必須有對應的背包物品。
 	if !inventoryItemID.Valid {
 		return errors.New("auction inventory item is missing")
+	}
+
+	// 流標前，確認沒有任何仍被保留的競標資金
+	var activeHoldCount int
+
+	err = tx.QueryRow(ctx, `
+    SELECT COUNT(*)
+    FROM auction_fund_holds
+    WHERE listing_id = $1
+      AND status = 'HELD'
+`, listingID).Scan(&activeHoldCount)
+
+	if err != nil {
+		return fmt.Errorf("check expired auction holds: %w", err)
+	}
+
+	if activeHoldCount > 0 {
+		return errors.New("cannot expire auction with active fund holds")
+	}
+
+	// 無人出價：將拍賣標記為流標，並解除物品上架狀態。
+	if !highestBidder.Valid {
+		// 鎖定物品，驗證目前仍屬賣家且處於上架狀態。
+		var itemOwnerID, itemStatus string
+
+		err = tx.QueryRow(ctx, `
+			SELECT owner_id, status
+			FROM inventory_items
+			WHERE id = $1
+			FOR UPDATE
+		`, inventoryItemID.String).Scan(
+			&itemOwnerID, &itemStatus,
+		)
+		if err != nil {
+			return fmt.Errorf("load expired auction item: %w", err)
+		}
+
+		if itemOwnerID != sellerID || itemStatus != "LISTED" {
+			return errors.New("expired auction item ownership or status mismatch")
+		}
+
+		// 還原物品為可用狀態，不改變所有權。
+		tag, err := tx.Exec(ctx, `
+			UPDATE inventory_items
+			SET status = 'AVAILABLE',
+				updated_at = NOW()
+			WHERE id = $1
+			  AND owner_id = $2
+			  AND status = 'LISTED'
+		`, inventoryItemID.String, sellerID)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return errors.New("failed to release expired auction item")
+		}
+
+		// 將拍賣標記為流標。
+		tag, err = tx.Exec(ctx, `
+			UPDATE auction_listings
+			SET status = 'expired',
+				updated_at = NOW()
+			WHERE id = $1
+			  AND status = 'active'
+		`, listingID)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return errors.New("failed to expire auction")
+		}
+
+		// 物品解除上架及拍賣狀態更新，一起提交。
+		return tx.Commit(ctx)
 	}
 
 	buyerID := highestBidder.String
