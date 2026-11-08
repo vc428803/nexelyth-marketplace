@@ -636,8 +636,8 @@ func SettleAuction(
 		return fmt.Errorf("load auction: %w", err)
 	}
 
-	// 冪等性：已結算完成就不再操作資金
-	if status == "completed" {
+	// 已成交或已流標的拍賣，不再重複執行結算
+	if status == "completed" || status == "expired" {
 		return nil
 	}
 
