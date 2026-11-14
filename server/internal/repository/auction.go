@@ -654,26 +654,26 @@ func SettleAuction(
 		return errors.New("auction inventory item is missing")
 	}
 
-	// 流標前，確認沒有任何仍被保留的競標資金
-	var activeHoldCount int
-
-	err = tx.QueryRow(ctx, `
-    SELECT COUNT(*)
-    FROM auction_fund_holds
-    WHERE listing_id = $1
-      AND status = 'HELD'
-`, listingID).Scan(&activeHoldCount)
-
-	if err != nil {
-		return fmt.Errorf("check expired auction holds: %w", err)
-	}
-
-	if activeHoldCount > 0 {
-		return errors.New("cannot expire auction with active fund holds")
-	}
-
-	// 無人出價：將拍賣標記為流標，並解除物品上架狀態。
+	// 無人出價：將拍賣標記為流標
 	if !highestBidder.Valid {
+		// 流標前確認沒有被保留的競標資金
+		var activeHoldCount int
+
+		err = tx.QueryRow(ctx, `
+			SELECT COUNT(*)
+			FROM auction_fund_holds
+			WHERE listing_id = $1
+			AND status = 'HELD'
+		`, listingID).Scan(&activeHoldCount)
+
+		if err != nil {
+			return fmt.Errorf("check expired auction holds: %w", err)
+		}
+
+		if activeHoldCount > 0 {
+			return errors.New("cannot expire auction with active fund holds")
+		}
+
 		// 鎖定物品，驗證目前仍屬賣家且處於上架狀態。
 		var itemOwnerID, itemStatus string
 
