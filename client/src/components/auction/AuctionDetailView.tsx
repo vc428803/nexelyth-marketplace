@@ -79,6 +79,19 @@ export default function AuctionDetailView({
 
   const endMs = new Date(listing.end_time).getTime();
   const active = listing.status.toLowerCase() === "active" && Number.isFinite(endMs) && endMs > now;
+  const auctionStatus = listing.status.toLowerCase();
+
+  const statusLabel =
+    auctionStatus === "completed"
+      ? "● 已成交"
+      : auctionStatus === "expired"
+        ? "● 已流標"
+        : active
+          ? "● 競標中"
+          : auctionStatus === "active"
+            ? "● 已截止，等待結算"
+            : "● 狀態未知";
+
   const parsedAmount = Number(amount);
   const canSubmit =
     !!onPlaceBid &&
@@ -123,7 +136,7 @@ export default function AuctionDetailView({
             <dl className="mb-6 space-y-3 border-y border-cyan-900/80 py-5 text-sm">
               <div className="flex items-center justify-between gap-4"><dt className="flex items-center gap-2 text-cyan-200"><Tag size={16} />分類</dt><dd>{listing.category || "未分類"}</dd></div>
               {listing.item_code && <div className="flex items-center justify-between gap-4"><dt className="flex items-center gap-2 text-cyan-200"><Sword size={16} />物品編號</dt><dd className="font-mono">{listing.item_code}</dd></div>}
-              <div className="flex items-center justify-between gap-4"><dt className="flex items-center gap-2 text-cyan-200"><ShieldCheck size={16} />拍賣狀態</dt><dd className={active ? "text-emerald-300" : "text-rose-300"}>{active ? "● 進行中" : "已結束或未開放"}</dd></div>
+              <div className="flex items-center justify-between gap-4"><dt className="flex items-center gap-2 text-cyan-200"><ShieldCheck size={16} />拍賣狀態</dt><dd className={active ? "text-emerald-300" : "text-rose-300"}>{statusLabel}</dd></div>
             </dl>
             <div className="space-y-4 rounded-xl border border-cyan-800/60 bg-[#03111f]/80 p-5">
               <div className="flex items-center justify-between gap-3"><span className="flex items-center gap-2 text-slate-300"><Clock3 size={17} />剩餘時間</span><strong className="text-xl font-bold tabular-nums text-rose-400">{formatCountdown(listing.end_time, now)}</strong></div>
@@ -132,32 +145,45 @@ export default function AuctionDetailView({
               <div className="flex items-center justify-between text-sm"><span className="text-slate-400">最低加價金額</span><span>{currencyLabel}{formatAmount(listing.min_increment)}</span></div>
             </div>
 
-            <form onSubmit={submit} className="mt-6 space-y-3">
-              <label htmlFor="nexelyth-bid-amount" className="block text-sm font-semibold text-amber-200">出價金額</label>
-              <div className="flex flex-col gap-3 sm:flex-row">
-                <input id="nexelyth-bid-amount" type="number" step="1" min={minBid} inputMode="numeric" value={amount}
-                  onChange={(e) => setAmount(e.target.value)} disabled={!onPlaceBid || !active || isSubmitting}
-                  className="min-w-0 flex-1 rounded-lg border border-cyan-700 bg-[#071d31] px-4 py-3 text-lg tabular-nums text-white outline-none focus:border-amber-400 disabled:opacity-50" />
-                <button
-                  type="submit"
-                  disabled={!canSubmit}
-                  className="inline-flex items-center justify-center gap-2 rounded-lg
+            {active ? (
+              <form onSubmit={submit} className="mt-6 space-y-3">
+                <label htmlFor="nexelyth-bid-amount" className="block text-sm font-semibold text-amber-200">出價金額</label>
+                <div className="flex flex-col gap-3 sm:flex-row">
+                  <input id="nexelyth-bid-amount" type="number" step="1" min={minBid} inputMode="numeric" value={amount}
+                    onChange={(e) => setAmount(e.target.value)} disabled={!onPlaceBid || !active || isSubmitting}
+                    className="min-w-0 flex-1 rounded-lg border border-cyan-700 bg-[#071d31] px-4 py-3 text-lg tabular-nums text-white outline-none focus:border-amber-400 disabled:opacity-50" />
+                  <button
+                    type="submit"
+                    disabled={!canSubmit}
+                    className="inline-flex items-center justify-center gap-2 rounded-lg
              bg-gradient-to-b from-amber-300 to-amber-600
              px-7 py-3 font-bold text-[#09111d]
              hover:brightness-110
              disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <Gavel size={19} />
-                  {isSubmitting
-                    ? "提交中…"
-                    : !onPlaceBid
-                      ? "出價功能待接入"
-                      : "出價競標"}
-                </button>
+                  >
+                    <Gavel size={19} />
+                    {isSubmitting
+                      ? "提交中…"
+                      : !onPlaceBid
+                        ? "出價功能待接入"
+                        : "出價競標"}
+                  </button>
+                </div>
+                <p className="text-xs text-slate-400">最低有效出價：{currencyLabel}{formatAmount(minBid)}。最終金額及資格由後端重新驗證。</p>
+                {bidError && <p role="alert" className="text-sm text-rose-300">{bidError}</p>}
+              </form>
+            ) : (
+              <div className="mt-6 rounded-xl border border-cyan-800/60 bg-[#03111f]/80 p-5 text-center">
+                <p className="font-semibold text-amber-200">
+                  {statusLabel}
+                </p>
+                <p className="mt-2 text-sm text-slate-400">
+                  此拍賣目前無法接受新的出價。
+                </p>
               </div>
-              <p className="text-xs text-slate-400">最低有效出價：{currencyLabel}{formatAmount(minBid)}。最終金額及資格由後端重新驗證。</p>
-              {bidError && <p role="alert" className="text-sm text-rose-300">{bidError}</p>}
-            </form>
+            )}
+
+
           </section>
         </div>
 
