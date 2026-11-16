@@ -14,6 +14,7 @@ import (
 	"todo_api/internal/app"
 	"todo_api/internal/config"
 	"todo_api/internal/database"
+	"todo_api/internal/stream"
 	"todo_api/internal/worker"
 )
 
@@ -108,6 +109,14 @@ func main() {
 	defer cr.Stop()
 
 	// ========================================
+	// 初始化 Auction SSE Event Hub
+	// ========================================
+
+	// 整個 Go Server 只建立一個 AuctionEventHub。
+	// 讓所有拍賣 SSE 訂閱者共用相同的事件中心。
+	auctionHub := stream.NewAuctionEventHub()
+
+	// ========================================
 	// 7. 註冊所有 API Routes
 	// ========================================
 	app.RegisterRoutes(
@@ -116,6 +125,7 @@ func main() {
 		cfg,
 		chatRoom,
 		productsCache,
+		auctionHub,
 	)
 
 	// ========================================

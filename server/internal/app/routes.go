@@ -18,6 +18,7 @@ func RegisterRoutes(
 	cfg *config.Config,
 	chatRoom *chat.Room,
 	productsCache *stream.ProductsCache,
+	auctionHub *stream.AuctionEventHub, // 新增：拍賣事件中心
 ) {
 	// 基礎健康檢查 / 根路由
 	approutes.RegisterHealthRoutes(router)
@@ -44,8 +45,7 @@ func RegisterRoutes(
 	approutes.RegisterUserRoutes(router, pool)
 
 	// Auction 模組
-	approutes.RegisterAuctionRoutes(router, pool, cfg)
-
+	approutes.RegisterAuctionRoutes(router, pool, cfg, auctionHub)
 	// Admin 模組
 	approutes.RegisterAdminRoutes(router, pool, cfg)
 
