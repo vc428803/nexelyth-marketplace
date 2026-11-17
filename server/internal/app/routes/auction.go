@@ -37,7 +37,7 @@ func RegisterAuctionRoutes(
 	// 對指定商品出價
 	router.POST(
 		"/auctions/:id/bids",
-		handlers.PlaceBidHandler(pool, cfg),
+		handlers.PlaceBidHandler(pool, cfg, auctionHub),
 	)
 
 	// 查詢出價紀錄

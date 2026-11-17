@@ -30,3 +30,7 @@ vendor/
 
 .env
 .env.*
+
+# Local authentication test cookies
+buyer-cookies.txt
+seller-cookies.txt

@@ -49,11 +49,18 @@ func main() {
 	defer stop()
 
 	// ========================================
+	// 初始化 Auction SSE Event Hub
+	// ========================================
+
+	// 整個 Go Server 只建立一個 AuctionEventHub。
+	// PlaceBidHandler 與 Auction Worker 共用。
+	auctionHub := stream.NewAuctionEventHub()
+
+	// ========================================
 	// 4. 啟動 Auction Background Worker
 	// ========================================
 
-	// Worker 使用獨立的 Context，
-	// 方便在 HTTP Server 關閉後通知 Worker 停止。
+	// Worker 使用獨立的 Context，方便在 HTTP Server 關閉後通知 Worker 停止。
 	workerCtx, cancelWorker := context.WithCancel(
 		context.Background(),
 	)
@@ -69,6 +76,7 @@ func main() {
 		worker.StartAuctionWorker(
 			workerCtx,
 			pool,
+			auctionHub, // 新增：共用拍賣事件中心
 		)
 
 		log.Println("Auction worker exited")
@@ -107,14 +115,6 @@ func main() {
 
 	// 保留既有背景服務清理
 	defer cr.Stop()
-
-	// ========================================
-	// 初始化 Auction SSE Event Hub
-	// ========================================
-
-	// 整個 Go Server 只建立一個 AuctionEventHub。
-	// 讓所有拍賣 SSE 訂閱者共用相同的事件中心。
-	auctionHub := stream.NewAuctionEventHub()
 
 	// ========================================
 	// 7. 註冊所有 API Routes

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"todo_api/internal/repository"
+	"todo_api/internal/stream"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -30,6 +31,7 @@ const (
 func StartAuctionWorker(
 	ctx context.Context,
 	pool *pgxpool.Pool,
+	auctionHub *stream.AuctionEventHub,
 ) {
 	slog.Info(
 		"Auction worker started",
@@ -43,7 +45,7 @@ func StartAuctionWorker(
 		return
 	}
 
-	checkExpiredAuctions(ctx, pool)
+	checkExpiredAuctions(ctx, pool, auctionHub)
 
 	// ========================================
 	// 2. 建立定期檢查 Ticker
@@ -67,7 +69,7 @@ func StartAuctionWorker(
 				return
 			}
 
-			checkExpiredAuctions(ctx, pool)
+			checkExpiredAuctions(ctx, pool, auctionHub)
 		}
 	}
 }
@@ -76,6 +78,7 @@ func StartAuctionWorker(
 func checkExpiredAuctions(
 	ctx context.Context,
 	pool *pgxpool.Pool,
+	auctionHub *stream.AuctionEventHub,
 ) {
 	// 若已收到停止訊號，不再查詢資料庫。
 	if ctx.Err() != nil {

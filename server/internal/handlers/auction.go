@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"net/http"
 	"time"
-
 	"todo_api/internal/config"
 	"todo_api/internal/models"
 	"todo_api/internal/repository"
+	"todo_api/internal/stream"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -149,28 +149,59 @@ func GetAuctionListingByIDHandler(pool *pgxpool.Pool) gin.HandlerFunc {
 }
 
 // 對某個拍賣商品出價
-func PlaceBidHandler(pool *pgxpool.Pool, cfg *config.Config) gin.HandlerFunc {
+
+func PlaceBidHandler(
+	pool *pgxpool.Pool,
+	cfg *config.Config,
+	auctionHub *stream.AuctionEventHub,
+) gin.HandlerFunc {
 	return func(c *gin.Context) {
+
+		// 1. 驗證玩家身分
 		userID, err := getUserIDFromCookie(c, cfg)
 		if err != nil {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"error": "unauthorized",
+			})
 			return
 		}
 
+		// 2. 取得拍賣 ID
 		listingID := c.Param("id")
 
+		// 3. 解析出價請求
 		var req models.PlaceBidRequest
 		if err := c.BindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": err.Error(),
+			})
 			return
 		}
 
-		err = repository.PlaceBid(pool, listingID, userID, req.BidAmount)
+		// 4. 執行 Repository 競標交易
+		err = repository.PlaceBid(
+			pool,
+			listingID,
+			userID,
+			req.BidAmount,
+		)
+
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": err.Error(),
+			})
 			return
 		}
 
+		// 5. Transaction Commit 成功後才發布事件
+		// 不修改資料庫，只通知訂閱該拍賣的前端。
+		auctionHub.Publish(stream.AuctionEvent{
+			Type:      "auction.bid.updated",
+			ListingID: listingID,
+			Timestamp: time.Now().UTC(),
+		})
+
+		// 6. 回傳出價成功
 		c.JSON(http.StatusOK, gin.H{
 			"message": "bid placed successfully",
 		})
