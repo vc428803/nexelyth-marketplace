@@ -597,18 +597,34 @@ func PlaceBid(pool *pgxpool.Pool, listingID string, bidderID string, bidAmount i
 	return tx.Commit(ctx)
 }
 
-// 已完成結算的拍賣再次呼叫時，不會重複付款或交付物品。
+// AuctionSettlementResult 回報本次是否真的完成新結算。
+type AuctionSettlementResult struct {
+	Settled bool
+	Status  string
+}
+
+// SettleAuction 保留原本介面，供手動結算工具使用。
 func SettleAuction(
 	ctx context.Context,
 	pool *pgxpool.Pool,
 	listingID string,
 ) error {
+	_, err := SettleAuctionWithResult(ctx, pool, listingID)
+	return err
+}
+
+// 已完成結算的拍賣再次呼叫時，不會重複付款或交付物品。
+func SettleAuctionWithResult(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	listingID string,
+) (result AuctionSettlementResult, err error) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
 	tx, err := pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return err
+		return result, err
 	}
 	defer tx.Rollback(ctx)
 
@@ -621,37 +637,40 @@ func SettleAuction(
 	var endTime time.Time
 
 	err = tx.QueryRow(ctx, `
-         SELECT seller_id, highest_bidder_id,
-                inventory_item_id, current_price,
-                status, end_time
-         FROM auction_listings
-         WHERE id = $1
-         FOR UPDATE
-     `, listingID).Scan(
+		SELECT seller_id, highest_bidder_id,
+		       inventory_item_id, current_price,
+		       status, end_time
+		FROM auction_listings
+		WHERE id = $1
+		FOR UPDATE
+	`, listingID).Scan(
 		&sellerID, &highestBidder,
 		&inventoryItemID, &currentPrice,
 		&status, &endTime,
 	)
 	if err != nil {
-		return fmt.Errorf("load auction: %w", err)
+		return result, fmt.Errorf("load auction: %w", err)
 	}
 
-	// 已成交或已流標的拍賣，不再重複執行結算
+	// 已成交或已流標，不再重複結算。
 	if status == "completed" || status == "expired" {
-		return nil
+		return AuctionSettlementResult{
+			Settled: false,
+			Status:  status,
+		}, nil
 	}
 
 	if status != "active" {
-		return errors.New("auction is not active")
+		return result, errors.New("auction is not active")
 	}
 
 	if time.Now().Before(endTime) {
-		return errors.New("auction has not ended")
+		return result, errors.New("auction has not ended")
 	}
 
-	// 無論成交或流標，都必須有對應的背包物品。
+	// 無論成交或流標，都必須有對應的背包物品
 	if !inventoryItemID.Valid {
-		return errors.New("auction inventory item is missing")
+		return result, errors.New("auction inventory item is missing")
 	}
 
 	// 無人出價：將拍賣標記為流標
@@ -663,18 +682,17 @@ func SettleAuction(
 			SELECT COUNT(*)
 			FROM auction_fund_holds
 			WHERE listing_id = $1
-			AND status = 'HELD'
+			  AND status = 'HELD'
 		`, listingID).Scan(&activeHoldCount)
-
 		if err != nil {
-			return fmt.Errorf("check expired auction holds: %w", err)
+			return result, fmt.Errorf("check expired auction holds: %w", err)
 		}
 
 		if activeHoldCount > 0 {
-			return errors.New("cannot expire auction with active fund holds")
+			return result, errors.New("cannot expire auction with active fund holds")
 		}
 
-		// 鎖定物品，驗證目前仍屬賣家且處於上架狀態。
+		// 鎖定物品，驗證仍屬賣家且處於上架狀態
 		var itemOwnerID, itemStatus string
 
 		err = tx.QueryRow(ctx, `
@@ -686,52 +704,59 @@ func SettleAuction(
 			&itemOwnerID, &itemStatus,
 		)
 		if err != nil {
-			return fmt.Errorf("load expired auction item: %w", err)
+			return result, fmt.Errorf("load expired auction item: %w", err)
 		}
 
 		if itemOwnerID != sellerID || itemStatus != "LISTED" {
-			return errors.New("expired auction item ownership or status mismatch")
+			return result, errors.New("expired auction item ownership or status mismatch")
 		}
 
-		// 還原物品為可用狀態，不改變所有權。
+		// 還原物品為可用狀態，不改變所有權
 		tag, err := tx.Exec(ctx, `
 			UPDATE inventory_items
 			SET status = 'AVAILABLE',
-				updated_at = NOW()
+			    updated_at = NOW()
 			WHERE id = $1
 			  AND owner_id = $2
 			  AND status = 'LISTED'
 		`, inventoryItemID.String, sellerID)
 		if err != nil {
-			return err
+			return result, err
 		}
 		if tag.RowsAffected() != 1 {
-			return errors.New("failed to release expired auction item")
+			return result, errors.New("failed to release expired auction item")
 		}
 
-		// 將拍賣標記為流標。
+		// 將拍賣標記為流標
 		tag, err = tx.Exec(ctx, `
 			UPDATE auction_listings
 			SET status = 'expired',
-				updated_at = NOW()
+			    updated_at = NOW()
 			WHERE id = $1
 			  AND status = 'active'
 		`, listingID)
 		if err != nil {
-			return err
+			return result, err
 		}
 		if tag.RowsAffected() != 1 {
-			return errors.New("failed to expire auction")
+			return result, errors.New("failed to expire auction")
 		}
 
-		// 物品解除上架及拍賣狀態更新，一起提交。
-		return tx.Commit(ctx)
+		// 物品解除上架與拍賣狀態更新，一起提交
+		if err := tx.Commit(ctx); err != nil {
+			return result, err
+		}
+
+		return AuctionSettlementResult{
+			Settled: true,
+			Status:  "expired",
+		}, nil
 	}
 
 	buyerID := highestBidder.String
 
 	if buyerID == sellerID {
-		return errors.New("seller cannot be winning bidder")
+		return result, errors.New("seller cannot be winning bidder")
 	}
 
 	// 2. 鎖定保留資金並驗證金額
@@ -741,42 +766,42 @@ func SettleAuction(
 	var holdBidderID string
 
 	err = tx.QueryRow(ctx, `
-         SELECT id, bid_id, bidder_id, amount
-         FROM auction_fund_holds
-         WHERE listing_id = $1
-           AND status = 'HELD'
-         FOR UPDATE
-     `, listingID).Scan(
+		SELECT id, bid_id, bidder_id, amount
+		FROM auction_fund_holds
+		WHERE listing_id = $1
+		  AND status = 'HELD'
+		FOR UPDATE
+	`, listingID).Scan(
 		&holdID, &holdBidID,
 		&holdBidderID, &holdAmount,
 	)
 	if err != nil {
-		return fmt.Errorf("load fund hold: %w", err)
+		return result, fmt.Errorf("load fund hold: %w", err)
 	}
 
 	if holdBidderID != buyerID ||
 		holdAmount != currentPrice ||
 		holdAmount <= 0 {
-		return errors.New("auction fund hold mismatch")
+		return result, errors.New("auction fund hold mismatch")
 	}
 
 	// 3. 鎖定物品並確認仍屬賣家
 	var itemOwnerID, itemStatus string
 
 	err = tx.QueryRow(ctx, `
-         SELECT owner_id, status
-         FROM inventory_items
-         WHERE id = $1
-         FOR UPDATE
-     `, inventoryItemID.String).Scan(
+		SELECT owner_id, status
+		FROM inventory_items
+		WHERE id = $1
+		FOR UPDATE
+	`, inventoryItemID.String).Scan(
 		&itemOwnerID, &itemStatus,
 	)
 	if err != nil {
-		return fmt.Errorf("load inventory item: %w", err)
+		return result, fmt.Errorf("load inventory item: %w", err)
 	}
 
 	if itemOwnerID != sellerID || itemStatus != "LISTED" {
-		return errors.New("inventory ownership or status mismatch")
+		return result, errors.New("inventory ownership or status mismatch")
 	}
 
 	// 4. 鎖定賣家錢包
@@ -784,97 +809,104 @@ func SettleAuction(
 	var sellerBalance int64
 
 	err = tx.QueryRow(ctx, `
-         SELECT id, balance
-         FROM wallets
-         WHERE user_id = $1
-           AND currency_code = 'G'
-         FOR UPDATE
-     `, sellerID).Scan(&sellerWalletID, &sellerBalance)
+		SELECT id, balance
+		FROM wallets
+		WHERE user_id = $1
+		  AND currency_code = 'G'
+		FOR UPDATE
+	`, sellerID).Scan(&sellerWalletID, &sellerBalance)
 	if err != nil {
-		return fmt.Errorf("load seller wallet: %w", err)
+		return result, fmt.Errorf("load seller wallet: %w", err)
 	}
 
 	// 避免 BIGINT 溢位
 	const maxInt64 = int64(^uint64(0) >> 1)
 
 	if sellerBalance > maxInt64-holdAmount {
-		return errors.New("seller wallet balance overflow")
+		return result, errors.New("seller wallet balance overflow")
 	}
 
 	newBalance := sellerBalance + holdAmount
 
 	// 5. 將已保留款項支付給賣家
 	tag, err := tx.Exec(ctx, `
-         UPDATE wallets
-         SET balance = $1,
-             updated_at = NOW()
-         WHERE id = $2
-     `, newBalance, sellerWalletID)
+		UPDATE wallets
+		SET balance = $1,
+		    updated_at = NOW()
+		WHERE id = $2
+	`, newBalance, sellerWalletID)
 	if err != nil {
-		return err
+		return result, err
 	}
 	if tag.RowsAffected() != 1 {
-		return errors.New("seller wallet update failed")
+		return result, errors.New("seller wallet update failed")
 	}
 
 	// 6. 建立賣家收入流水
 	_, err = tx.Exec(ctx, `
-         INSERT INTO wallet_transactions
-             (wallet_id, amount_delta, balance_after,
-              transaction_type, reference_id)
-         VALUES ($1, $2, $3, 'SALE', $4)
-     `, sellerWalletID, holdAmount, newBalance, holdBidID)
+		INSERT INTO wallet_transactions
+			(wallet_id, amount_delta, balance_after,
+			 transaction_type, reference_id)
+		VALUES ($1, $2, $3, 'SALE', $4)
+	`, sellerWalletID, holdAmount, newBalance, holdBidID)
 	if err != nil {
-		return err
+		return result, err
 	}
 
 	// 7. 將保留資金標記為已結算
 	tag, err = tx.Exec(ctx, `
-         UPDATE auction_fund_holds
-         SET status = 'SETTLED',
-             updated_at = NOW()
-         WHERE id = $1
-           AND status = 'HELD'
-     `, holdID)
+		UPDATE auction_fund_holds
+		SET status = 'SETTLED',
+		    updated_at = NOW()
+		WHERE id = $1
+		  AND status = 'HELD'
+	`, holdID)
 	if err != nil {
-		return err
+		return result, err
 	}
 	if tag.RowsAffected() != 1 {
-		return errors.New("fund hold settlement failed")
+		return result, errors.New("fund hold settlement failed")
 	}
 
 	// 8. 轉移物品所有權給得標者
 	tag, err = tx.Exec(ctx, `
-         UPDATE inventory_items
-         SET owner_id = $1,
-             status = 'AVAILABLE',
-             updated_at = NOW()
-         WHERE id = $2
-           AND owner_id = $3
-           AND status = 'LISTED'
-     `, buyerID, inventoryItemID.String, sellerID)
+		UPDATE inventory_items
+		SET owner_id = $1,
+		    status = 'AVAILABLE',
+		    updated_at = NOW()
+		WHERE id = $2
+		  AND owner_id = $3
+		  AND status = 'LISTED'
+	`, buyerID, inventoryItemID.String, sellerID)
 	if err != nil {
-		return err
+		return result, err
 	}
 	if tag.RowsAffected() != 1 {
-		return errors.New("inventory transfer failed")
+		return result, errors.New("inventory transfer failed")
 	}
 
 	// 9. 將拍賣標記為完成
 	tag, err = tx.Exec(ctx, `
-         UPDATE auction_listings
-         SET status = 'completed',
-             updated_at = NOW()
-         WHERE id = $1
-           AND status = 'active'
-     `, listingID)
+		UPDATE auction_listings
+		SET status = 'completed',
+		    updated_at = NOW()
+		WHERE id = $1
+		  AND status = 'active'
+	`, listingID)
 	if err != nil {
-		return err
+		return result, err
 	}
 	if tag.RowsAffected() != 1 {
-		return errors.New("auction completion failed")
+		return result, errors.New("auction completion failed")
 	}
 
 	// 10. 全部成功才正式提交
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return result, err
+	}
+
+	return AuctionSettlementResult{
+		Settled: true,
+		Status:  "completed",
+	}, nil
 }
