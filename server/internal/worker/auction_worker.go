@@ -237,6 +237,38 @@ func checkExpiredAuctions(
 			"Auction settlement completed",
 			"listingID", listingID,
 		)
+
+		// 結算成功後重新查詢資料庫，取得實際最終狀態。
+		// 不修改 SettleAuction() 原本的交易邏輯。
+		listing, err := repository.GetAuctionListingByID(pool, listingID)
+		if err != nil {
+			slog.Error(
+				"Failed to fetch settled auction status",
+				"listingID", listingID,
+				"error", err,
+			)
+			continue
+		}
+
+		if !publishAuctionSettlementEvent(
+			auctionHub,
+			listingID,
+			listing.Status,
+		) {
+			slog.Warn(
+				"Unexpected auction status after settlement",
+				"listingID", listingID,
+				"status", listing.Status,
+			)
+			continue
+		}
+
+		slog.Info(
+			"Auction settlement SSE event published",
+			"listingID", listingID,
+			"status", listing.Status,
+		)
+
 	}
 
 	// ========================================
@@ -248,4 +280,31 @@ func checkExpiredAuctions(
 		"success", successCount,
 		"failed", failedCount,
 	)
+}
+
+func publishAuctionSettlementEvent(
+	hub *stream.AuctionEventHub,
+	listingID string,
+	status string,
+) bool {
+	var eventType string
+
+	switch status {
+	case "completed":
+		eventType = "auction.completed"
+
+	case "expired":
+		eventType = "auction.expired"
+
+	default:
+		return false
+	}
+
+	hub.Publish(stream.AuctionEvent{
+		Type:      eventType,
+		ListingID: listingID,
+		Timestamp: time.Now().UTC(),
+	})
+
+	return true
 }
