@@ -74,7 +74,6 @@ func StartAuctionWorker(
 	}
 }
 
-// checkExpiredAuctions 查詢已截止但尚未結算的拍賣。
 func checkExpiredAuctions(
 	ctx context.Context,
 	pool *pgxpool.Pool,
@@ -133,18 +132,13 @@ func checkExpiredAuctions(
 				"Failed to scan auction ID",
 				"error", err,
 			)
-
 			rows.Close()
 			return
 		}
 
-		listingIDs = append(
-			listingIDs,
-			listingID,
-		)
+		listingIDs = append(listingIDs, listingID)
 	}
 
-	// 檢查查詢結果是否完整讀取
 	if err := rows.Err(); err != nil {
 		rows.Close()
 
@@ -163,8 +157,6 @@ func checkExpiredAuctions(
 	// 4. 關閉 Rows，釋放資料庫連線
 	// ========================================
 	rows.Close()
-
-	// Query Context 已不再需要
 	cancel()
 
 	if ctx.Err() != nil {
@@ -189,28 +181,30 @@ func checkExpiredAuctions(
 	// ========================================
 	successCount := 0
 	failedCount := 0
+	skippedCount := 0
 
 	for _, listingID := range listingIDs {
 
-		// 每筆結算前檢查取消訊號
+		// 每筆結算前檢查取消訊號。
 		if ctx.Err() != nil {
 			slog.Info(
 				"Auction settlement batch cancelled",
 				"success", successCount,
 				"failed", failedCount,
+				"skipped", skippedCount,
 			)
 			return
 		}
 
-		// 重用已完成的 SettleAuction()
-		err := repository.SettleAuction(
+		// 執行結算，直接取得本次交易結果。
+		result, err := repository.SettleAuctionWithResult(
 			ctx,
 			pool,
 			listingID,
 		)
 
 		if err != nil {
-			// 關閉時取消的操作不視為一般失敗
+			// 關閉時取消的操作不視為一般失敗。
 			if ctx.Err() != nil {
 				slog.Info(
 					"Auction settlement interrupted",
@@ -227,38 +221,42 @@ func checkExpiredAuctions(
 				"error", err,
 			)
 
-			// 單筆失敗不阻止其他拍賣結算
+			// 單筆失敗不阻止其他拍賣結算。
 			continue
 		}
 
+		// 已結算過的拍賣，不重複發布 SSE。
+		if !result.Settled {
+			skippedCount++
+
+			slog.Info(
+				"Auction already settled, skipping SSE event",
+				"listingID", listingID,
+				"status", result.Status,
+			)
+			continue
+		}
+
+		// Repository 已確認本次 Transaction Commit 成功。
 		successCount++
 
 		slog.Info(
 			"Auction settlement completed",
 			"listingID", listingID,
+			"status", result.Status,
 		)
 
-		// 結算成功後重新查詢資料庫，取得實際最終狀態。
-		// 不修改 SettleAuction() 原本的交易邏輯。
-		listing, err := repository.GetAuctionListingByID(pool, listingID)
-		if err != nil {
-			slog.Error(
-				"Failed to fetch settled auction status",
-				"listingID", listingID,
-				"error", err,
-			)
-			continue
-		}
-
+		// 直接使用 Repository 回傳的最終狀態。
+		// 不需要重新查詢 GetAuctionListingByID()。
 		if !publishAuctionSettlementEvent(
 			auctionHub,
 			listingID,
-			listing.Status,
+			result.Status,
 		) {
 			slog.Warn(
 				"Unexpected auction status after settlement",
 				"listingID", listingID,
-				"status", listing.Status,
+				"status", result.Status,
 			)
 			continue
 		}
@@ -266,9 +264,8 @@ func checkExpiredAuctions(
 		slog.Info(
 			"Auction settlement SSE event published",
 			"listingID", listingID,
-			"status", listing.Status,
+			"status", result.Status,
 		)
-
 	}
 
 	// ========================================
@@ -279,6 +276,7 @@ func checkExpiredAuctions(
 		"total", len(listingIDs),
 		"success", successCount,
 		"failed", failedCount,
+		"skipped", skippedCount,
 	)
 }
 
