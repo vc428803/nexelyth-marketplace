@@ -53,15 +53,25 @@ func main() {
 	// 請勿將此工具暴露為公開 HTTP API。
 	ctx := context.Background()
 
-	// 結算與物品轉移
-	if err := repository.SettleAuction(
+	result, err := repository.SettleAuctionWithResult(
 		ctx,
 		pool,
 		*listingID,
-	); err != nil {
+	)
+
+	if err != nil {
 		log.Printf("Settlement failed: %v", err)
 		os.Exit(1)
 	}
 
-	fmt.Println("Settlement completed successfully")
+	if !result.Settled {
+		fmt.Println("Auction already settled")
+		fmt.Println("Status:", result.Status)
+		fmt.Println("No new settlement performed")
+		return
+	}
+
+	fmt.Println("New settlement completed successfully")
+	fmt.Println("Status:", result.Status)
+
 }
