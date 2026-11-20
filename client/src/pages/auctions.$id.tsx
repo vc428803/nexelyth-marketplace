@@ -184,7 +184,10 @@ function AuctionDetailPage() {
 
       console.log("Bid placed successfully:", result.message);
 
-      // 主動更新，避免只依賴 SSE 通知
+      // 通知 Navbar 重新查詢玩家錢包餘額
+      window.dispatchEvent(new Event("wallet:updated"));
+
+      // 主動更新拍賣資料
       const controller = new AbortController();
       await loadAuction(controller.signal);
     } catch (err) {
