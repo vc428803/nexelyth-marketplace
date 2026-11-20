@@ -38,6 +38,8 @@ function Navabr() {
   // Wallet 狀態
   const [wallet, setWallet] = useState<WalletResponse | null>(null);
   const [walletLoading, setWalletLoading] = useState(false);
+  const [walletRefreshKey, setWalletRefreshKey] = useState(0);
+
 
   // 取得登入資訊
   const auth = useContext(AuthContext);
@@ -47,6 +49,19 @@ function Navabr() {
   }
 
   const { isAuthenticated, userInfo, authLoading, logout } = auth;
+
+  // 收到錢包更新通知時，重新觸發錢包查詢
+  useEffect(() => {
+    const handleWalletUpdated = () => {
+      setWalletRefreshKey((prev) => prev + 1);
+    };
+
+    window.addEventListener("wallet:updated", handleWalletUpdated);
+
+    return () => {
+      window.removeEventListener("wallet:updated", handleWalletUpdated);
+    };
+  }, []);
 
   useEffect(() => {
     if (!isAuthenticated || !userInfo?.id) {
@@ -90,7 +105,7 @@ function Navabr() {
     void loadWallet();
 
     return () => controller.abort();
-  }, [isAuthenticated, userInfo?.id]);
+  }, [isAuthenticated, userInfo?.id, walletRefreshKey]);
 
   const pathname = useRouterState({
     select: (state) => state.location.pathname,
