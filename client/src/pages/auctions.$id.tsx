@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { apiUrl } from "../config/api";
 import AuctionDetailView, {
@@ -26,10 +26,20 @@ function AuctionDetailPage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [bidError, setBidError] = useState("");
 
+  // 記錄最新一次查詢的版本
+  const requestIdRef = useRef(0);
+  // 記錄是否已成功取得目前拍賣資料
+  const hasLoadedListingRef = useRef(false);
 
-  const loadAuction = useCallback(async (signal: AbortSignal) => {
-    setLoading(true);
-    setError("");
+  const loadAuction = useCallback(async (
+    signal: AbortSignal,
+    background = false,
+  ) => {
+    const requestId = ++requestIdRef.current;
+    if (!background) {
+      setLoading(true);
+      setError("");
+    }
 
     try {
       const [listingRes, bidsRes] = await Promise.all([
@@ -72,21 +82,39 @@ function AuctionDetailPage() {
         }));
       }
 
-      if (signal.aborted) return;
+      // 忽略已取消或過期的 API 回應
+      if (signal.aborted || requestId !== requestIdRef.current) {
+        return;
+      }
+
+      hasLoadedListingRef.current = true;
 
       setListing(listingPayload.data);
       setBids(bidRecords);
+      setError("");
+
+      // 確保首次載入時，即使由背景請求取得資料，
+      // 也可以正確結束 Loading
+      setLoading(false);
     } catch (err) {
-      if (signal.aborted) return;
+      if (signal.aborted || requestId !== requestIdRef.current) {
+        return;
+      }
 
       console.error("Failed to fetch auction details", err);
-      setError(
-        err instanceof Error
-          ? err.message
-          : "拍賣資料載入失敗",
-      );
+
+      if (!hasLoadedListingRef.current) {
+        setError(
+          err instanceof Error
+            ? err.message
+            : "拍賣資料載入失敗",
+        );
+      }
     } finally {
-      if (!signal.aborted) {
+      if (
+        !signal.aborted &&
+        requestId === requestIdRef.current
+      ) {
         setLoading(false);
       }
     }
@@ -118,14 +146,11 @@ function AuctionDetailPage() {
     eventSource.onopen = () => {
       console.log("Auction SSE connected:", id);
 
-      // 重連後補回可能遺失的事件
-      if (connectedOnce) {
-        refreshController?.abort();
-        refreshController = new AbortController();
-        void loadAuction(refreshController.signal);
-      }
+      // 第一次連線及重新連線，都向後端同步最新資料
+      refreshController?.abort();
+      refreshController = new AbortController();
 
-      connectedOnce = true;
+      void loadAuction(refreshController.signal, true);
     };
 
     // 收到出價更新事件
@@ -135,7 +160,7 @@ function AuctionDetailPage() {
       refreshController?.abort();
       refreshController = new AbortController();
 
-      void loadAuction(refreshController.signal);
+      void loadAuction(refreshController.signal, true);
     });
 
     eventSource.onerror = () => {
